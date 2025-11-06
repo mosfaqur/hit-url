@@ -1,7 +1,7 @@
 import requests
 import random
 import time
-from typing import List
+from typing import List, Optional
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -31,6 +31,12 @@ MAX_PROXIES_TO_TEST = 100  # Max proxies to download and test
 NUM_THREADS = 10  # Number of parallel threads
 NUM_REQUESTS_PER_URL = 50  # How many times to hit each URL
 DELAY_BETWEEN_REQUESTS = 0.1  # Delay in seconds (lower for parallel)
+
+# Redirect handling
+FOLLOW_REDIRECTS = True  # Follow redirects like curl -L
+
+# Proxy health settings
+MAX_PROXY_FAILURES = 3  # Remove proxy after this many consecutive failures
 
 # Thread-safe counter
 class Stats:
@@ -152,51 +158,129 @@ def validate_proxies_parallel(proxy_list: List[str], max_workers: int = 20) -> L
     logger.info(f"Validation complete: {len(working_proxies)}/{len(proxy_list)} proxies are working")
     return working_proxies
 
-def hit_url_with_proxy(url: str, proxy: str = None, timeout: int = 10) -> dict:
+def hit_url_with_proxy(url: str, proxy: Optional[str] = None, timeout: int = 10) -> dict:
     """Hit a URL using a proxy."""
     proxies = None
     if proxy:
         proxies = {'http': proxy, 'https': proxy}
-    
+
     try:
         response = requests.get(
             url,
             proxies=proxies,
             timeout=timeout,
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+            allow_redirects=FOLLOW_REDIRECTS
         )
+        final_url = response.url if FOLLOW_REDIRECTS else url
+        redirect_count = len(response.history) if FOLLOW_REDIRECTS else 0
         return {
             'success': True,
             'status_code': response.status_code,
-            'url': url,
+            'requested_url': url,
             'proxy': proxy if proxy else 'Direct',
-            'response_time': response.elapsed.total_seconds()
+            'response_time': response.elapsed.total_seconds(),
+            'final_url': final_url,
+            'redirects': redirect_count
         }
     except requests.exceptions.ProxyError:
-        return {'success': False, 'error': 'Proxy Error', 'url': url, 'proxy': proxy}
+        return {'success': False, 'error': 'Proxy Error', 'requested_url': url, 'proxy': proxy}
     except requests.exceptions.Timeout:
-        return {'success': False, 'error': 'Timeout', 'url': url, 'proxy': proxy}
+        return {'success': False, 'error': 'Timeout', 'requested_url': url, 'proxy': proxy}
+    except requests.exceptions.TooManyRedirects:
+        return {'success': False, 'error': 'Too Many Redirects', 'requested_url': url, 'proxy': proxy}
     except requests.exceptions.RequestException as e:
-        return {'success': False, 'error': str(e)[:50], 'url': url, 'proxy': proxy}
+        return {'success': False, 'error': str(e)[:50], 'requested_url': url, 'proxy': proxy}
 
-def process_url_batch(url: str, proxies: List[str], num_requests: int, stats: Stats):
+
+class ProxyPool:
+    """Manage proxy selection and evict unhealthy proxies."""
+
+    def __init__(self, proxies: List[str]):
+        self._lock = Lock()
+        self._proxies = list(proxies)
+        self._failure_counts = {proxy: 0 for proxy in proxies if proxy}
+
+    def _remove_proxy(self, proxy: str, reason: str, failures: int):
+        self._proxies = [p for p in self._proxies if p != proxy]
+        self._failure_counts.pop(proxy, None)
+        logger.warning(
+            f"Removing proxy {proxy} after {failures} consecutive failures ({reason})."
+        )
+
+    def get_proxy(self) -> Optional[str]:
+        with self._lock:
+            if not self._proxies:
+                return None
+            return random.choice(self._proxies)
+
+    def report_success(self, proxy: Optional[str]):
+        if not proxy:
+            return
+        with self._lock:
+            if proxy in self._failure_counts:
+                self._failure_counts[proxy] = 0
+
+    def report_failure(self, proxy: Optional[str], reason: str):
+        if not proxy:
+            return
+        with self._lock:
+            failures = self._failure_counts.get(proxy, 0) + 1
+            self._failure_counts[proxy] = failures
+            if failures >= MAX_PROXY_FAILURES:
+                self._remove_proxy(proxy, reason, failures)
+
+    def remaining(self) -> int:
+        with self._lock:
+            return len(self._proxies)
+
+
+def process_url_batch(
+    url: str,
+    proxy_pool: Optional[ProxyPool],
+    num_requests: int,
+    stats: Stats,
+):
     """Process multiple requests for a single URL."""
+    target_url = url
+    resolved_notice_logged = False
+
     for i in range(num_requests):
-        proxy = random.choice(proxies)
-        result = hit_url_with_proxy(url, proxy)
-        
+        proxy = proxy_pool.get_proxy() if proxy_pool else None
+        if proxy_pool and proxy is None:
+            logger.error("No proxies remaining. Stopping requests for this URL.")
+            break
+
+        result = hit_url_with_proxy(target_url, proxy)
+
         if result['success']:
+            if proxy_pool:
+                proxy_pool.report_success(proxy)
+            final_url = result.get('final_url', target_url)
+            redirect_info = ''
+            if FOLLOW_REDIRECTS and final_url != result['requested_url']:
+                redirect_info = f" -> {final_url}"
+                if not resolved_notice_logged:
+                    logger.info(
+                        f"Resolved redirect for {url} -> {final_url}. "
+                        "Using resolved destination for future requests."
+                    )
+                    resolved_notice_logged = True
+                target_url = final_url
             stats.increment_success()
             logger.info(
-                f"✓ {url[:30]}... | Status: {result['status_code']} | "
+                f"✓ {result['requested_url'][:30]}...{redirect_info} | "
+                f"Status: {result['status_code']} | "
                 f"Time: {result['response_time']:.2f}s | Proxy: {proxy}"
             )
         else:
+            if proxy_pool:
+                proxy_pool.report_failure(proxy, result.get('error', 'Unknown error'))
             stats.increment_fail()
             logger.warning(
-                f"✗ {url[:30]}... | Error: {result['error']} | Proxy: {proxy}"
+                f"✗ {result['requested_url'][:30]}... | Error: {result['error']} | Proxy: {proxy}"
             )
-        
+
         time.sleep(DELAY_BETWEEN_REQUESTS)
 
 def main():
@@ -244,7 +328,14 @@ def main():
     logger.info(f"\n{'='*60}")
     logger.info(f"Starting multi-threaded URL hitting")
     logger.info(f"URLs: {len(urls)} | Requests per URL: {NUM_REQUESTS_PER_URL}")
-    logger.info(f"Threads: {NUM_THREADS} | Working Proxies: {len(proxies)}")
+    proxy_pool = None
+    if proxies == [None]:
+        logger.info("Threads: %s | Using direct connections", NUM_THREADS)
+    else:
+        proxy_pool = ProxyPool(proxies)
+        logger.info(
+            "Threads: %s | Working Proxies: %s", NUM_THREADS, proxy_pool.remaining()
+        )
     logger.info(f"{'='*60}\n")
     
     try:
@@ -252,7 +343,13 @@ def main():
         with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
             futures = []
             for url in urls:
-                future = executor.submit(process_url_batch, url, proxies, NUM_REQUESTS_PER_URL, stats)
+                future = executor.submit(
+                    process_url_batch,
+                    url,
+                    proxy_pool,
+                    NUM_REQUESTS_PER_URL,
+                    stats,
+                )
                 futures.append(future)
             
             # Wait for all to complete
