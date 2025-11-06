@@ -32,6 +32,9 @@ NUM_THREADS = 10  # Number of parallel threads
 NUM_REQUESTS_PER_URL = 50  # How many times to hit each URL
 DELAY_BETWEEN_REQUESTS = 0.1  # Delay in seconds (lower for parallel)
 
+# Redirect handling
+FOLLOW_REDIRECTS = True  # Follow redirects like curl -L
+
 # Thread-safe counter
 class Stats:
     def __init__(self):
@@ -157,46 +160,68 @@ def hit_url_with_proxy(url: str, proxy: str = None, timeout: int = 10) -> dict:
     proxies = None
     if proxy:
         proxies = {'http': proxy, 'https': proxy}
-    
+
     try:
         response = requests.get(
             url,
             proxies=proxies,
             timeout=timeout,
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'},
+            allow_redirects=FOLLOW_REDIRECTS
         )
+        final_url = response.url if FOLLOW_REDIRECTS else url
+        redirect_count = len(response.history) if FOLLOW_REDIRECTS else 0
         return {
             'success': True,
             'status_code': response.status_code,
-            'url': url,
+            'requested_url': url,
             'proxy': proxy if proxy else 'Direct',
-            'response_time': response.elapsed.total_seconds()
+            'response_time': response.elapsed.total_seconds(),
+            'final_url': final_url,
+            'redirects': redirect_count
         }
     except requests.exceptions.ProxyError:
-        return {'success': False, 'error': 'Proxy Error', 'url': url, 'proxy': proxy}
+        return {'success': False, 'error': 'Proxy Error', 'requested_url': url, 'proxy': proxy}
     except requests.exceptions.Timeout:
-        return {'success': False, 'error': 'Timeout', 'url': url, 'proxy': proxy}
+        return {'success': False, 'error': 'Timeout', 'requested_url': url, 'proxy': proxy}
+    except requests.exceptions.TooManyRedirects:
+        return {'success': False, 'error': 'Too Many Redirects', 'requested_url': url, 'proxy': proxy}
     except requests.exceptions.RequestException as e:
-        return {'success': False, 'error': str(e)[:50], 'url': url, 'proxy': proxy}
+        return {'success': False, 'error': str(e)[:50], 'requested_url': url, 'proxy': proxy}
 
 def process_url_batch(url: str, proxies: List[str], num_requests: int, stats: Stats):
     """Process multiple requests for a single URL."""
+    target_url = url
+    resolved_notice_logged = False
+
     for i in range(num_requests):
         proxy = random.choice(proxies)
-        result = hit_url_with_proxy(url, proxy)
-        
+        result = hit_url_with_proxy(target_url, proxy)
+
         if result['success']:
+            final_url = result.get('final_url', target_url)
+            redirect_info = ''
+            if FOLLOW_REDIRECTS and final_url != result['requested_url']:
+                redirect_info = f" -> {final_url}"
+                if not resolved_notice_logged:
+                    logger.info(
+                        f"Resolved redirect for {url} -> {final_url}. "
+                        "Using resolved destination for future requests."
+                    )
+                    resolved_notice_logged = True
+                target_url = final_url
             stats.increment_success()
             logger.info(
-                f"✓ {url[:30]}... | Status: {result['status_code']} | "
+                f"✓ {result['requested_url'][:30]}...{redirect_info} | "
+                f"Status: {result['status_code']} | "
                 f"Time: {result['response_time']:.2f}s | Proxy: {proxy}"
             )
         else:
             stats.increment_fail()
             logger.warning(
-                f"✗ {url[:30]}... | Error: {result['error']} | Proxy: {proxy}"
+                f"✗ {result['requested_url'][:30]}... | Error: {result['error']} | Proxy: {proxy}"
             )
-        
+
         time.sleep(DELAY_BETWEEN_REQUESTS)
 
 def main():
